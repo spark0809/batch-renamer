@@ -2,15 +2,18 @@
 """
 批量重命名工具 (BatchRenamer)
 功能：批量添加前缀/后缀、删除指定文本、替换文本、自动编号、修改扩展名、撤销操作。
-纯本地运行，无需联网，无需安装第三方库（仅使用 Python 标准库）。
+支持把文件夹拖入窗口加载。
+依赖：仅 Python 标准库 + tkinterdnd2（仅一个第三方库，用于支持拖拽）。
 """
 
 import json
 import os
+import re
 import sys
 import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+from tkinterdnd2 import DND_FILES, TkinterDnD
 
 # Windows 文件名非法字符
 ILLEGAL_CHARS = set('\\/:*?"<>|')
@@ -206,13 +209,13 @@ def app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-class RenamerApp(tk.Tk):
+class RenamerApp(TkinterDnD.Tk):
 
     def __init__(self):
         super().__init__()
         self.title("批量重命名工具")
-        self.geometry("1020x680")
-        self.minsize(900, 600)
+        self.geometry("1020x760")
+        self.minsize(900, 680)
 
         self.folder = tk.StringVar()
         self.recursive = tk.BooleanVar(value=False)
@@ -248,20 +251,55 @@ class RenamerApp(tk.Tk):
     # ---------------- 界面搭建 ----------------
 
     def _build_ui(self):
-        # 顶部：目录选择
+        # ============ 顶部工具栏：醒目的执行按钮 + 文件夹选择 ============
         top = ttk.Frame(self, padding=8)
         top.pack(fill=tk.X)
-        ttk.Label(top, text="目标文件夹:").pack(side=tk.LEFT)
-        ttk.Entry(top, textvariable=self.folder).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
-        ttk.Button(top, text="浏览…", command=self._browse).pack(side=tk.LEFT)
-        ttk.Checkbutton(top, text="包含子文件夹", variable=self.recursive,
+
+        # 大号绿色执行按钮（最显眼位置：顶部最左）
+        self.run_btn = tk.Button(
+            top, text="▶  执行重命名  (Ctrl+Enter)", command=self._execute,
+            bg="#2ecc71", fg="white",
+            activebackground="#27ae60", activeforeground="white",
+            font=("Microsoft YaHei", 12, "bold"),
+            relief="raised", bd=3, padx=24, pady=10, cursor="hand2",
+        )
+        self.run_btn.pack(side=tk.LEFT, padx=(0, 12))
+
+        # 撤销按钮（小一些）
+        self.undo_btn = ttk.Button(top, text="↺ 撤销上一次", command=self._undo)
+        self.undo_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        # 刷新按钮
+        ttk.Button(top, text="刷新列表", command=self._load_files).pack(side=tk.LEFT)
+
+        # 第二行：文件夹选择 + 过滤
+        folder_bar = ttk.Frame(self, padding=(8, 0, 8, 4))
+        folder_bar.pack(fill=tk.X)
+        ttk.Label(folder_bar, text="目标文件夹:").pack(side=tk.LEFT)
+        self.folder_entry = ttk.Entry(folder_bar, textvariable=self.folder)
+        self.folder_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        ttk.Button(folder_bar, text="浏览…", command=self._browse).pack(side=tk.LEFT)
+        ttk.Checkbutton(folder_bar, text="包含子文件夹", variable=self.recursive,
                         command=self._load_files).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Label(top, text="  扩展名过滤:").pack(side=tk.LEFT, padx=(8, 0))
-        flt = ttk.Entry(top, textvariable=self.ext_filter, width=14)
+        ttk.Label(folder_bar, text="  扩展名过滤:").pack(side=tk.LEFT, padx=(8, 0))
+        flt = ttk.Entry(folder_bar, textvariable=self.ext_filter, width=14)
         flt.pack(side=tk.LEFT)
         flt.bind("<Return>", lambda e: self._load_files())
-        ttk.Label(top, text="(如 jpg;png，空为全部)").pack(side=tk.LEFT)
-        ttk.Button(top, text="加载文件", command=self._load_files).pack(side=tk.LEFT, padx=6)
+        ttk.Label(folder_bar, text="(如 jpg;png，空为全部)").pack(side=tk.LEFT)
+        ttk.Button(folder_bar, text="加载文件", command=self._load_files).pack(side=tk.LEFT, padx=6)
+
+        # 绑定快捷键 Ctrl+Enter
+        self.bind("<Control-Return>", lambda e: self._execute())
+
+        # 拖拽提示（覆盖在文件夹输入框上的可拖拽区域）
+        self.drop_hint = tk.Label(
+            self, text="📂 把文件夹拖到此处即可加载\n（也可拖到下方任意位置）",
+            bg="#eaf4ff", fg="#3a7bd5",
+            font=("Microsoft YaHei", 11, "bold"),
+            relief="ridge", borderwidth=2, padx=20, pady=8,
+        )
+        self.drop_hint.place(relx=0.5, y=12, anchor="n")
+        self.drop_hint.lower()  # 默认隐藏，仅在拖拽悬浮时显示
 
         # 中部：左侧规则 + 右侧预览
         mid = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
@@ -291,17 +329,73 @@ class RenamerApp(tk.Tk):
         self.tree.tag_configure("invalid", foreground="#c0392b")
         self.tree.tag_configure("unchanged", foreground="#999999")
 
-        # 底部：操作区
-        bottom = ttk.Frame(self, padding=8)
-        bottom.pack(fill=tk.X)
-        self.run_btn = ttk.Button(bottom, text="执行重命名", command=self._execute)
-        self.run_btn.pack(side=tk.LEFT)
-        self.undo_btn = ttk.Button(bottom, text="撤销上一次操作", command=self._undo)
-        self.undo_btn.pack(side=tk.LEFT, padx=8)
-        ttk.Button(bottom, text="刷新列表", command=self._load_files).pack(side=tk.LEFT)
-        self.status_var = tk.StringVar(value="请选择文件夹并加载文件")
-        ttk.Label(bottom, textvariable=self.status_var, foreground="#555")\
-            .pack(side=tk.RIGHT)
+        # 底部：操作区（带浅绿色背景，醒目提示）
+        bottom = tk.Frame(self, bg="#e8f8f0", bd=1, relief="solid", highlightbackground="#2ecc71", highlightthickness=1)
+        bottom.pack(fill=tk.X, padx=8, pady=(4, 8))
+
+        # 状态信息（左侧）
+        self.status_var = tk.StringVar(value="📌 请选择文件夹或拖入文件夹后加载文件")
+        tk.Label(bottom, textvariable=self.status_var, bg="#e8f8f0",
+                 fg="#2c3e50", font=("Microsoft YaHei", 10),
+                 padx=10, pady=10).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # 底部也放一个执行按钮（双保险）
+        run_btn2 = tk.Button(
+            bottom, text="▶  执行重命名", command=self._execute,
+            bg="#2ecc71", fg="white",
+            activebackground="#27ae60", activeforeground="white",
+            font=("Microsoft YaHei", 11, "bold"),
+            relief="raised", bd=2, padx=20, pady=8, cursor="hand2",
+        )
+        run_btn2.pack(side=tk.RIGHT, padx=10, pady=6)
+
+        # 注册拖拽目标：整个窗口 + 文件夹输入框都能接收
+        self.drop_target_register(DND_FILES)
+        self.dnd_bind("<<Drop>>", self._on_drop)
+        self.dnd_bind("<<DropEnter>>", self._on_drop_enter)
+        self.dnd_bind("<<DropLeave>>", self._on_drop_leave)
+        self.folder_entry.drop_target_register(DND_FILES)
+        self.folder_entry.dnd_bind("<<Drop>>", self._on_drop)
+
+    # ---------------- 拖拽支持 ----------------
+
+    def _parse_drop_data(self, data):
+        """
+        tkinterdnd2 给出的 data 形如：
+          - 普通路径:  C:/folder/file.txt
+          - 含空格:    {C:/path with space/file.txt}
+          - 多个文件:  {C:/a.txt} {C:/b.txt} C:/folder
+        返回首个合法路径。
+        """
+        if not data:
+            return ""
+        # 用正则按空白分割，但保留 {xxx} 完整
+        tokens = re.findall(r"\{[^}]*\}|\S+", data)
+        for tok in tokens:
+            path = tok.strip("{}") if tok.startswith("{") else tok
+            if path and (os.path.isdir(path) or os.path.isfile(path)):
+                return path
+        return ""
+
+    def _on_drop(self, event):
+        path = self._parse_drop_data(event.data)
+        self._on_drop_leave(event)  # 隐藏提示
+        if not path:
+            messagebox.showwarning("拖拽失败", "无法识别拖入的内容，请拖入文件夹或文件。")
+            return
+        # 拖入文件 → 取其所在目录
+        if os.path.isfile(path):
+            path = os.path.dirname(path)
+        self.folder.set(path)
+        self._load_files()
+        self.status_var.set("已通过拖拽加载文件夹：%s" % path)
+
+    def _on_drop_enter(self, event):
+        self.drop_hint.lift()
+        self.drop_hint.configure(bg="#dceefc", fg="#1e6fd9")
+
+    def _on_drop_leave(self, event):
+        self.drop_hint.lower()
 
     def _build_rules(self, parent):
         # 删除文本
